@@ -193,6 +193,17 @@ set HF_ENDPOINT=https://huggingface.co
 
 ---
 
+## 维护范围
+
+**只维护 Windows。** Mac 和 Linux 的适配不接，提了也不会做。
+
+这个项目解决的是一个具体问题：我的 Windows 上缺一个顺手的语音输入。它不是一个跨平台产品，
+也没打算变成跨平台产品。想要 Mac 版的，那边有更合适的原生方案。
+
+issue 只回 bug，功能请求不保证回应。
+
+---
+
 ## 许可
 
 MIT
