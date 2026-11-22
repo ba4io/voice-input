@@ -14,7 +14,9 @@ Windows 专用。用 [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - **自动清理**：去掉"嗯、呃、那个、就是说"，补全标点
 - **热词纠错**：把常用的错听词自动换成正确写法，改文件即时生效
 - **浮窗**：录音时显示电平条，转写时显示"识别中…"，完成显示字数
-- **不碰剪贴板**：用 SendInput 逐字注入，不会覆盖你剪贴板里的内容
+- **两种投递方式**：默认用 SendInput 逐字注入，不碰剪贴板；也可以切成"写剪贴板 + 合成 Ctrl+V"，对某些自绘控件更稳，还能配合跨屏软件把字送到另一台机器
+- **单实例**：重复启动会自己退出，不会两个程序抢热键
+- **日志轮转**：日志超过 5MB 自动转存一份 `.1`，不会无限变长
 
 ---
 
@@ -126,8 +128,33 @@ set HF_ENDPOINT=https://huggingface.co
 | `mute_background` | 录音时是否静音其它声音 |
 | `clean_fillers` | 是否去掉"嗯、那个" |
 | `suppress_side_buttons` | 是否拦截鼠标侧键 |
+| `output` | 投递方式：`inject`（逐字注入，默认）/ `clipboard`（写剪贴板 + 合成粘贴） |
+| `clipboard_paste_method` | 剪贴板模式下怎么粘：`sendinput` / `message`（WM_PASTE）/ `auto` |
+| `clipboard_sync_delay` | 写剪贴板后等多久再发粘贴键（跨屏软件同步用），默认 0.30 秒 |
+| `clipboard_verify_timeout` | 粘贴后等目标控件文本变化的时间，默认 0.80 秒 |
+| `clipboard_rewrite_tries` | 粘贴前发现剪贴板被改写时最多重写几次 |
+| `paste_mod_wait` | 粘贴前等物理修饰键松开的上限，默认 1.5 秒 |
+| `remote_port` / `remote_token` / `remote_bind` | 跨机模式用，见下面"跨机使用"；默认关闭 |
 
 改完重启程序生效。`hotwords.txt` 和 `whisper.txt` 是即时生效的。
+
+### 投递方式怎么选
+
+| | `inject`（默认） | `clipboard` |
+|---|---|---|
+| 原理 | 逐字 SendInput 注入 | 写剪贴板后合成 Ctrl+V |
+| 剪贴板 | 不动 | **会覆盖你剪贴板里的内容** |
+| 适用 | 绝大多数输入框 | 自绘控件、浏览器渲染框，或配合跨屏软件 |
+| 失败时 | 无痕迹 | 文字留在剪贴板，手动 Ctrl+V 即可 |
+
+### 跨机使用（可选）
+
+如果你用 Mouse Without Borders 之类的软件在两台机器间共享键鼠，可以把 `output` 设成 `clipboard`：
+识别结果会写进剪贴板，再合成 Ctrl+V，按键由跨屏软件转发到光标所在的那台机器，文字就落在那边。
+
+如果还想在**另一台机器的键盘**上按热键触发，把 `remote_agent.py` 拷到那台机器、配上
+`remote_host` / `remote_port` / `remote_token`，并在这台机器的 `config.json` 里打开
+`remote_port` 和同一个 `remote_token`。监听地址可用 `remote_bind` 收窄到具体网卡。
 
 ### 不知道麦克风叫什么
 
@@ -166,6 +193,8 @@ set HF_ENDPOINT=https://huggingface.co
 - **Windows 专用**。键盘鼠标钩子、SendInput 都是 Win32 的东西
 - **Whisper 会对静音瞎编**。程序已经用"有声帧比例"过滤过，但如果环境噪声很大，仍可能蹦出莫名其妙的一句
 - **中文标点是补出来的**。Whisper 本身不太输出句末句号，靠规则补，偶尔会有多余或缺失
+- **剪贴板模式会覆盖剪贴板**。换来的是更强的兼容性；失败时文字还在剪贴板里，手动 Ctrl+V 能救回来
+- **按住热键说时，热键本身仍是 Ctrl**。误触其它键会变成 Ctrl 组合键（比如 Ctrl+S），说话时尽量别碰键盘
 
 ---
 

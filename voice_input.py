@@ -7,9 +7,11 @@
 识别结果自动粘贴到光标处。
 """
 import os
+import atexit
 import re
 import time
 import ctypes
+import socket
 import threading
 import queue
 from ctypes import wintypes
@@ -29,6 +31,48 @@ import winsound
 # 下面的值是默认值。想改就改同目录的 config.json，首次运行会自动生成。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+LOG = os.path.join(BASE_DIR, "voice_input.log")
+HOTWORDS = os.path.join(BASE_DIR, "hotwords.txt")
+
+
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 超过 5MB 就轮转，只保留上一份
+
+
+def log(msg):
+    line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        if os.path.getsize(LOG) > LOG_MAX_BYTES:
+            os.replace(LOG, LOG + ".1")
+    except OSError:
+        pass
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+_instance_mutex = None
+
+
+def acquire_single_instance(name):
+    """获取 Local\\ 单实例互斥；重复启动写日志后返回 False。"""
+    global _instance_mutex
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = kernel32.CreateMutexW(None, False, name)
+    err = ctypes.get_last_error()
+    if not h:
+        log("创建单实例互斥失败: %d" % err)
+        return False
+    if err == 183:      # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(h)
+        log("已有实例在运行，本实例退出")
+        return False
+    _instance_mutex = h
+    return True
 
 DEFAULTS = {
     "hotkey": "right ctrl",         # 键盘热键
@@ -38,6 +82,19 @@ DEFAULTS = {
     "mute_background": True,        # 录音时静音其它音频，防回声
     "clean_fillers": True,          # 去掉"嗯、那个、就是说"
     "suppress_side_buttons": True,  # 拦截鼠标侧键，防止触发前进/后退
+    "remote_port": 0,               # 远端入口端口；0 = 关闭
+    "remote_token": "",             # 远端鉴权口令
+    "remote_bind": "0.0.0.0",       # 远端监听地址；填具体网卡 IP 可收窄暴露面
+    "remote_disconnect_grace": 2.0, # 远端断开后等待多久丢弃本次录音
+    "output": "inject",             # inject = 逐字注入（默认）；clipboard = 写剪贴板并合成粘贴
+    "clipboard_paste_method": "auto",   # sendinput / message(WM_PASTE) / auto
+    "clipboard_sync_delay": 0.30,   # 写剪贴板后等 MWB 同步/目标程序稳定的秒数
+    "clipboard_verify_timeout": 0.80,   # 粘贴后等目标控件文本变化的秒数
+    "clipboard_rewrite_tries": 3,   # 粘贴前发现剪贴板被改写时最多重写几次
+    "paste_mod_wait": 1.50,         # 粘贴前等物理修饰键松开的最长秒数
+    "force_release_modifiers": False,   # 超时后是否补发 KEYUP（默认不补，避免和物理按键打架）
+    "paste_key_gap": 0.03,          # Ctrl 按下到 V 按下、松开之间的间隔
+    "paste_hold": 0.06,             # V 按住时长
 }
 
 
@@ -59,6 +116,24 @@ def load_config():
 
 CFG = load_config()
 
+
+def _cfg_float(key, default, minimum=0.0):
+    raw = CFG.get(key, default)
+    try:
+        return max(minimum, float(raw))
+    except (TypeError, ValueError):
+        log("config.json 的 %s=%r 无效，已用默认值 %r" % (key, raw, default))
+        return default
+
+
+def _cfg_int(key, default, minimum=1):
+    raw = CFG.get(key, default)
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        log("config.json 的 %s=%r 无效，已用默认值 %r" % (key, raw, default))
+        return default
+
 HOTKEY = CFG["hotkey"]
 SUPPRESS_SIDE_BUTTONS = CFG["suppress_side_buttons"]
 MODEL_SIZE = CFG["model"]
@@ -66,6 +141,25 @@ LANGUAGE = CFG["language"] or None
 DEVICE_HINT = CFG["device_hint"]
 MUTE_BACKGROUND = CFG["mute_background"]
 CLEAN_FILLERS = CFG["clean_fillers"]
+OUTPUT = (CFG.get("output") or "inject").lower()
+if OUTPUT not in ("inject", "clipboard"):
+    print("config.json 的 output=%r 无效，已改用 inject" % OUTPUT)
+    OUTPUT = "inject"
+CLIP_SYNC_DELAY = _cfg_float("clipboard_sync_delay", 0.30, 0.0)
+PASTE_MOD_WAIT = _cfg_float("paste_mod_wait", 1.50, 0.2)
+REMOTE_PORT = _cfg_int("remote_port", 0, 0)
+REMOTE_BIND = CFG.get("remote_bind") or "0.0.0.0"   # 只绑这块网卡，减少局域网暴露面
+REMOTE_TOKEN = CFG.get("remote_token") or ""
+REMOTE_DISCONNECT_GRACE = _cfg_float("remote_disconnect_grace", 2.0, 0.0)
+PASTE_METHOD = (CFG.get("clipboard_paste_method") or "auto").lower()
+if PASTE_METHOD not in ("auto", "sendinput", "message"):
+    print("config.json 的 clipboard_paste_method=%r 无效，已改用 auto" % PASTE_METHOD)
+    PASTE_METHOD = "auto"
+CLIP_VERIFY_TIMEOUT = _cfg_float("clipboard_verify_timeout", 0.80, 0.1)
+CLIP_REWRITE_TRIES = _cfg_int("clipboard_rewrite_tries", 3, 1)
+FORCE_RELEASE_MODIFIERS = bool(CFG.get("force_release_modifiers", False))
+PASTE_KEY_GAP = _cfg_float("paste_key_gap", 0.03, 0.0)
+PASTE_HOLD = _cfg_float("paste_hold", 0.06, 0.0)
 
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.4
@@ -74,17 +168,33 @@ DEBOUNCE = 0.30
 KB_TAP = 0.50              # 键盘按住短于此视为"轻点"，进入连续录音
 SILENT_RATIO = 0.10
 SILENT_DB = -45.0
-LOG = os.path.join(BASE_DIR, "voice_input.log")
-HOTWORDS = os.path.join(BASE_DIR, "hotwords.txt")
+_SIDED_KEYS = {
+    "ctrl": ("left ctrl", "right ctrl"),
+    "alt": ("left alt", "right alt"),
+    "shift": ("left shift", "right shift"),
+}
 
 
-def log(msg):
-    line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+def exact_scan_codes(name):
+    """只保留这个键独占的扫描码。
+
+    keyboard 库解析 'right ctrl' 会连带返回左 Ctrl 的 29，导致 Ctrl+C 的
+    Ctrl 也被当成热键。这里减掉同一修饰键另一侧共有的码。
+    """
     try:
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        codes = set(keyboard.key_to_scan_codes(name))
     except Exception:
-        pass
+        return set()
+    for pair in _SIDED_KEYS.values():
+        if name in pair:
+            other = pair[0] if name == pair[1] else pair[1]
+            try:
+                codes -= set(keyboard.key_to_scan_codes(other))
+            except Exception:
+                pass
+    if not codes:
+        codes = set(keyboard.key_to_scan_codes(name))
+    return codes
 
 
 ui_state = {"active": False, "level": 0.0, "status": ""}
@@ -260,6 +370,7 @@ def install_mouse_hook(on_down, on_up, suppress=True):
 
 
 # ---------------- 录音 ----------------
+_mute_lock = threading.Lock()
 _mute_state = {"vol": None}
 
 
@@ -280,6 +391,9 @@ def list_devices():
 def mute_background():
     if not MUTE_BACKGROUND:
         return
+    with _mute_lock:
+        if _mute_state.get("vol") is not None:
+            return
     try:
         import comtypes
         comtypes.CoInitialize()      # 每个线程都要初始化 COM
@@ -288,17 +402,20 @@ def mute_background():
     try:
         from pycaw.pycaw import AudioUtilities
         vol = AudioUtilities.GetSpeakers().EndpointVolume
-        if not vol.GetMute():
-            vol.SetMute(1, None)
-            _mute_state["vol"] = vol
+        with _mute_lock:
+            if _mute_state.get("vol") is None and not vol.GetMute():
+                vol.SetMute(1, None)
+                _mute_state["vol"] = vol
     except Exception as e:
         log("静音背景音频失败: %s" % str(e)[:120])
 
 
 def unmute_background():
-    vol = _mute_state.get("vol")
-    if vol is None:
-        return
+    with _mute_lock:
+        vol = _mute_state.get("vol")
+        if vol is None:
+            return
+        _mute_state["vol"] = None
     try:
         import comtypes
         comtypes.CoInitialize()
@@ -308,7 +425,9 @@ def unmute_background():
         vol.SetMute(0, None)
     except Exception:
         pass
-    _mute_state["vol"] = None
+
+
+atexit.register(unmute_background)
 
 
 FILLER_PATTERNS = [
@@ -356,7 +475,7 @@ class Recorder:
             if not cands:
                 log("没有名字含「%s」的输入设备，改用系统默认" % DEVICE_HINT)
                 return None, 1
-            cands.sort(key=lambda x: (0 if x[1] == 1 else 1 if x[1] == 2 else 2, x[0]))
+            cands.sort(key=lambda x: (0 if x[1] == 2 else 1, x[0]))
             idx, ch, name = cands[0]
             log("使用输入设备: [%d] %s (%d声道)" % (idx, name, ch))
             return idx, 2 if ch >= 2 else 1
@@ -577,6 +696,7 @@ class _INPUTUNION(ctypes.Union):
 
 
 class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)      # 让 _INPUT(ki=...) 真正写进 u.ki，而不是塞进 __dict__
     _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
 
 
@@ -587,16 +707,36 @@ _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
 INPUT_KEYBOARD = 1
 
+_injecting = {"n": 0, "last": 0.0}   # n>0 或刚发完都算合成按键，钩子必须放过
+_deliver_lock = threading.Lock()
+
+
+def _begin_inject():
+    _injecting["n"] += 1
+
+
+def _end_inject():
+    _injecting["n"] = max(0, _injecting["n"] - 1)
+    _injecting["last"] = time.time()
+
 
 def _send(units):
     n = len(units)
     if not n:
-        return
+        return 0
     arr = (_INPUT * n)()
     for i, u in enumerate(units):
         arr[i].type = INPUT_KEYBOARD
         arr[i].u.ki = u
-    _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+    _begin_inject()
+    try:
+        sent = _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+    finally:
+        _end_inject()
+    if sent != n:
+        log("SEND_SHORT 按键事件只被接受 %d/%d，错误 %d"
+            % (sent, n, ctypes.get_last_error()))
+    return sent
 
 
 def _kb(vk=0, scan=0, flags=0):
@@ -626,37 +766,601 @@ def type_text(t):
             unit = int.from_bytes(raw[i:i + 2], "little")
             batch.append(_kb(0, unit, _KEYEVENTF_UNICODE))
             batch.append(_kb(0, unit, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
+    sent = 0
     for i in range(0, len(batch), 64):
-        _send(batch[i:i + 64])
+        sent += _send(batch[i:i + 64])
         time.sleep(0.005)
+    if sent < len(batch):
+        log("TYPE_SHORT 逐字注入只被接收 %d/%d 个事件" % (sent, len(batch)))
 
 
-def paste_text(text):
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+VK_CONTROL = 0x11
+VK_V = 0x56
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_LSHIFT = 0xA0
+VK_RSHIFT = 0xA1
+VK_LMENU = 0xA4
+VK_RMENU = 0xA5
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+
+_kernel32 = ctypes.windll.kernel32
+_kernel32.GlobalAlloc.restype = ctypes.c_void_p
+_kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+_kernel32.GlobalLock.restype = ctypes.c_void_p
+_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalFree.restype = ctypes.c_void_p
+_kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+
+_user32.OpenClipboard.restype = wintypes.BOOL
+_user32.OpenClipboard.argtypes = [wintypes.HWND]
+_user32.EmptyClipboard.restype = wintypes.BOOL
+_user32.CloseClipboard.restype = wintypes.BOOL
+_user32.GetClipboardData.restype = ctypes.c_void_p
+_user32.GetClipboardData.argtypes = [wintypes.UINT]
+_user32.SetClipboardData.restype = ctypes.c_void_p
+_user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+_user32.MapVirtualKeyW.restype = wintypes.UINT
+
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+WM_PASTE = 0x0302
+SMTO_ABORTIFHUNG = 0x0002
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", _RECT)]
+
+
+_user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
+_user32.GetGUIThreadInfo.restype = wintypes.BOOL
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+_user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+_user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+
+_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+_kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+
+_MODIFIERS = (
+    ("左Ctrl", VK_LCONTROL, 0x1D, 0),
+    ("右Ctrl", VK_RCONTROL, 0x1D, _KEYEVENTF_EXTENDEDKEY),
+    ("左Shift", VK_LSHIFT, 0x2A, 0),
+    ("右Shift", VK_RSHIFT, 0x36, 0),
+    ("左Alt", VK_LMENU, 0x38, 0),
+    ("右Alt", VK_RMENU, 0x38, _KEYEVENTF_EXTENDEDKEY),
+    ("左Win", VK_LWIN, 0x5B, _KEYEVENTF_EXTENDEDKEY),
+    ("右Win", VK_RWIN, 0x5C, _KEYEVENTF_EXTENDEDKEY),
+)
+
+
+def foreground_window():
+    """前台窗口的 hwnd / pid / 进程名 / 标题，只用于日志和诊断。"""
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return {"hwnd": 0, "pid": 0, "app": "?", "title": ""}
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        title = ctypes.create_unicode_buffer(256)
+        _user32.GetWindowTextW(hwnd, title, 256)
+        app = "?"
+        h = _kernel32.OpenProcess(0x1000, False, pid.value)   # QUERY_LIMITED_INFORMATION
+        if h:
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(512)
+            if _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                app = buf.value.split("\\")[-1]
+            _kernel32.CloseHandle(h)
+        return {"hwnd": int(hwnd), "pid": pid.value, "app": app, "title": title.value[:60]}
+    except Exception:
+        return {"hwnd": 0, "pid": 0, "app": "?", "title": ""}
+
+
+def _class_name(hwnd):
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    n = _user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value if n else ""
+
+
+def focus_window():
+    """前台线程真正拿到键盘焦点的控件。
+
+    GetForegroundWindow 只说明窗口在前台，不代表焦点在编辑区：焦点可能在
+    地址栏、工具栏、webview 外壳，甚至已经不在了。合成粘贴是不是落在编辑
+    框里，要看 hwndFocus。
+    """
+    fg = foreground_window()
+    hwnd = fg["hwnd"]
+    if not hwnd:
+        return {"hwnd": 0, "class": "", "fg": fg}
+    tid = _user32.GetWindowThreadProcessId(hwnd, None)
+    info = _GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+    focus = 0
+    if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+        focus = int(info.hwndFocus or info.hwndActive or hwnd)
+    else:
+        focus = int(hwnd)
+    return {"hwnd": focus, "class": _class_name(focus), "fg": fg}
+
+
+def _send_message_timeout(hwnd, msg, wparam, lparam, timeout=300):
+    """跨进程取文本/发 WM_PASTE。超时返回 None，避免卡在挂起的窗口上。"""
+    result = ctypes.c_size_t(0)
+    ok = _user32.SendMessageTimeoutW(
+        hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG, timeout, ctypes.byref(result))
+    if not ok:
+        return None
+    return int(result.value)
+
+
+def _is_text_class(cls):
+    c = (cls or "").lower()
+    return any(hint in c for hint in ("edit", "richedit", "scintilla"))
+
+
+def read_control_text(hwnd, timeout=400):
+    """读标准编辑控件的文本，用于判断粘贴到底有没有生效。
+
+    只有 Edit/RichEdit/Scintilla 这类控件能可靠跨进程 WM_GETTEXT；读不到
+    就返回 None，表示"无法确认"，调用方不能据此重试，否则可能粘两遍。
+    """
+    if not hwnd:
+        return None
+    length = _send_message_timeout(hwnd, WM_GETTEXTLENGTH, 0, 0, timeout)
+    if length is None or length < 0 or length > 4000000:
+        return None
+    if length == 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    n = _send_message_timeout(
+        hwnd, WM_GETTEXT, length + 1,
+        ctypes.cast(buf, ctypes.c_void_p).value, timeout)
+    if n is None or n <= 0:
+        return None
+    return buf.value
+
+
+def _open_clipboard(retries=12, wait=0.05):
+    for _ in range(retries):
+        if _user32.OpenClipboard(None):
+            return True
+        time.sleep(wait)
+    return False
+
+
+def get_clipboard_text():
+    """读回 CF_UNICODETEXT，用来确认刚写进去的内容还在。"""
+    if not _open_clipboard(4, 0.03):
+        return None
+    try:
+        h = _user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = _kernel32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            _kernel32.GlobalUnlock(h)
+    except Exception:
+        return None
+    finally:
+        _user32.CloseClipboard()
+
+
+def _set_clipboard_text_once(text):
+    """写一次剪贴板。内存先准备好再抢剪贴板，SetClipboardData 成功后句柄归系统。"""
+    data = text.encode("utf-16-le") + b"\x00\x00"
+    h = _kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not h:
+        log("CLIP_ALLOC_FAIL 剪贴板内存分配失败")
+        return False
+    p = _kernel32.GlobalLock(h)
+    if not p:
+        _kernel32.GlobalFree(h)
+        log("CLIP_LOCK_FAIL 剪贴板内存加锁失败")
+        return False
+    ctypes.memmove(p, data, len(data))
+    _kernel32.GlobalUnlock(h)
+    if not _open_clipboard():
+        _kernel32.GlobalFree(h)
+        log("CLIP_BUSY 剪贴板被占用，写入失败")
+        return False
+    try:
+        if not _user32.EmptyClipboard():
+            _kernel32.GlobalFree(h)
+            log("CLIP_EMPTY_FAIL EmptyClipboard 失败，错误 %d" % ctypes.get_last_error())
+            return False
+        if not _user32.SetClipboardData(CF_UNICODETEXT, h):
+            _kernel32.GlobalFree(h)
+            log("CLIP_SET_FAIL SetClipboardData 失败，错误 %d" % ctypes.get_last_error())
+            return False
+        return True
+    finally:
+        _user32.CloseClipboard()
+
+
+def set_clipboard_text(text):
+    """写 CF_UNICODETEXT，失败时尽量不让剪贴板变成空的。
+
+    EmptyClipboard 之后 SetClipboardData 仍可能失败（剪贴板被别的进程抢走、
+    内存句柄无效等）。这里重试三次；仍然失败就尽量把原内容放回去，至少保证
+    用户手动 Ctrl+V 不会粘出空内容。
+    """
+    old = get_clipboard_text()
+    for _ in range(3):
+        if _set_clipboard_text_once(text):
+            return True
+        time.sleep(0.05)
+    log("CLIP_WRITE_FAIL 连续 3 次写入失败")
+    if old is not None and old != text:
+        if _set_clipboard_text_once(old):
+            log("CLIP_RESTORED 已恢复原剪贴板内容（%d 字）" % len(old))
+        else:
+            log("CLIP_RESTORE_FAIL 原剪贴板内容也没能恢复")
+    return False
+
+
+def _send_key(vk, scan=0, flags=0):
+    """发一个按键事件。返回 True 表示系统接收了这 1 个事件。"""
+    unit = _INPUT()
+    unit.type = INPUT_KEYBOARD
+    unit.u.ki = _kb(vk, scan, flags)
+    _begin_inject()
+    try:
+        n = _user32.SendInput(1, ctypes.byref(unit), ctypes.sizeof(_INPUT))
+    finally:
+        _end_inject()
+    return n == 1
+
+
+def _mods_down():
+    return [(name, vk, scan, ext) for name, vk, scan, ext in _MODIFIERS
+            if _user32.GetAsyncKeyState(vk) & 0x8000]
+
+
+def wait_modifiers_released(timeout=None, force=None):
+    """粘贴前等物理修饰键松开。
+
+    默认不补发 KEYUP：用户物理按着 Shift/Ctrl 时，我们补一个 KEYUP 会让
+    Windows 的按键状态和真实键盘脱节，用户后面松开时还会再发一次 up。
+    超时就放弃本次合成粘贴（剪贴板里已经有文字，可以手动 Ctrl+V）。
+    """
+    if timeout is None:
+        timeout = PASTE_MOD_WAIT
+    if force is None:
+        force = FORCE_RELEASE_MODIFIERS
+    end = time.time() + max(0.0, timeout)
+    while time.time() < end:
+        if not _mods_down():
+            return True
+        time.sleep(0.02)
+    stuck = _mods_down()
+    if not stuck:
+        return True
+    names = ",".join(x[0] for x in stuck)
+    if not force:
+        log("PASTE_MOD_STUCK 修饰键未松开: %s，放弃粘贴（剪贴板保留识别文本）" % names)
+        return False
+    log("PASTE_MOD_STUCK 修饰键未松开: %s，按配置补发 KEYUP" % names)
+    for _name, vk, scan, ext in stuck:
+        _send_key(vk, scan, _KEYEVENTF_KEYUP | ext)
+    time.sleep(0.05)
+    return not _mods_down()
+
+
+def _send_ctrl_v():
+    """分四步发 Ctrl+V，并只松开自己按下过的键。
+
+    分步发送能控制按住时长，更接近真实键盘；关键是 Ctrl 按下失败时绝不能
+    补发 Ctrl up，否则会把用户物理按住的 Ctrl 状态打乱。
+    """
+    sc_ctrl = _user32.MapVirtualKeyW(VK_CONTROL, 0) or 0x1D
+    sc_v = _user32.MapVirtualKeyW(VK_V, 0) or 0x2F
+    ctrl_down = False       # 当前是否还按着，供 finally 收尾用
+    v_down = False
+    ctrl_pressed = False    # Ctrl 是否真的按下过；不受收尾逻辑影响
+    v_pressed = False       # V 是否真的按下过；不受收尾逻辑影响
+    sent = 0
+    try:
+        if not _send_key(VK_CONTROL, sc_ctrl, 0):
+            log("PASTE_CTRL_DOWN_FAIL Ctrl 按下未被接收")
+            return False
+        ctrl_down = True
+        ctrl_pressed = True
+        sent += 1
+        time.sleep(PASTE_KEY_GAP)
+        if not _send_key(VK_V, sc_v, 0):
+            log("PASTE_V_DOWN_FAIL V 按下未被接收")
+            return False
+        v_down = True
+        v_pressed = True
+        sent += 1
+        time.sleep(PASTE_HOLD)
+        if _send_key(VK_V, sc_v, _KEYEVENTF_KEYUP):
+            v_down = False
+            sent += 1
+        else:
+            log("PASTE_V_UP_FAIL V 松开未被接收")
+        time.sleep(PASTE_KEY_GAP)
+    finally:
+        if v_down and _send_key(VK_V, sc_v, _KEYEVENTF_KEYUP):
+            v_down = False
+            sent += 1
+        if ctrl_down and _send_key(VK_CONTROL, sc_ctrl, _KEYEVENTF_KEYUP):
+            ctrl_down = False
+            sent += 1
+    log("PASTE_SENT Ctrl+V 发送 %d/4 | gap=%.0fms hold=%.0fms | fg=%s"
+        % (sent, PASTE_KEY_GAP * 1000, PASTE_HOLD * 1000, foreground_window()))
+    # 只要 Ctrl 和 V 的按下都被系统接收，就按"已投递"处理。V-up 丢了也不能
+    # 回退逐字注入，否则可能粘一遍再打一遍。
+    # 注意用 v_pressed：v_down 会在 V-up 成功后清掉，不能再拿它判断"按过"。
+    # Ctrl 同理，用 ctrl_pressed，避免收尾清状态后把成功误判成失败。
+    return ctrl_pressed and v_pressed
+
+
+def _clip_equal(a, b):
+    """剪贴板回读比较；只把换行差异归一化，其它字符必须一致。"""
+    if a is None or b is None:
+        return a is b
+    return a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
+
+
+def _paste_message(hwnd):
+    """直接给焦点控件发 WM_PASTE，绕过低级键盘钩子（MWB 那一层）。"""
+    if not hwnd:
+        return False
+    result = _send_message_timeout(hwnd, WM_PASTE, 0, 0, 600)
+    ok = result is not None
+    log("PASTE_MSG WM_PASTE hwnd=%d class=%s -> %s"
+        % (hwnd, _class_name(hwnd) or "?", "ok" if ok else "fail"))
+    return ok
+
+
+def _verify_paste(focus_hwnd, before, timeout=None):
+    """True=确认文本变了，False=确认没变，None=控件不支持读回，无法确认。"""
+    if before is None or not focus_hwnd:
+        return None
+    end = time.time() + (CLIP_VERIFY_TIMEOUT if timeout is None else timeout)
+    while time.time() < end:
+        after = read_control_text(focus_hwnd)
+        if after is None:
+            return None
+        if after != before:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+PASTE_OK = "ok"
+PASTE_UNVERIFIED = "unverified"
+PASTE_FAILED = "failed"
+PASTE_NOT_SENT = "not_sent"
+PASTE_BLOCKED = "blocked"
+
+
+def paste_clipboard(text, sync_delay=None, remote=False):
+    """写剪贴板 -> 回读校验 -> 合成粘贴 -> 尽量验证。
+
+    返回值：
+      ok          已粘贴，且标准编辑控件文本确认变化
+      unverified  按键已发出，但目标控件不支持读回，不能确认
+      failed      能确认目标控件文本没变（SendInput 和 WM_PASTE 都没生效）
+      not_sent    剪贴板没写成功/按键没发出，可以安全回退逐字注入
+      blocked     修饰键没松开或没有前台窗口，主动放弃，不回退
+    remote=True 时只发一次 Ctrl+V，验证结果只写日志，不尝试 WM_PASTE
+    或逐字注入；剪贴板写入失败/按键失败也不回退。
+    先写剪贴板，后面任何一步失败时剪贴板里都保留识别文本。
+    """
+    delay = CLIP_SYNC_DELAY if sync_delay is None else sync_delay
+    if not set_clipboard_text(text):
+        log("CLIP_WRITE_FAIL 剪贴板写入失败，未发粘贴键")
+        return PASTE_NOT_SENT
+    back = get_clipboard_text()
+    if _clip_equal(back, text):
+        log("CLIP_OK 已写剪贴板 %d 字" % len(text))
+    else:
+        log("CLIP_VERIFY_MISMATCH 回读不一致，重写一次")
+        if set_clipboard_text(text) and _clip_equal(get_clipboard_text(), text):
+            log("CLIP_REWRITE_OK 重写后回读一致")
+        else:
+            log("CLIP_REWRITE_FAIL 剪贴板里可能不是本次文本")
+
+    # 先等物理键松开，再进入 MWB 同步窗口；等太久也不怕，剪贴板已经写好了。
+    if not wait_modifiers_released():
+        log("PASTE_ABORT_MOD 修饰键未松开，放弃合成粘贴，剪贴板保留识别文本")
+        return PASTE_BLOCKED
+
+    if delay > 0:
+        time.sleep(delay)
+
+    # MWB 可能在延迟期间同步/重写剪贴板；发键前再确认并重写。
+    stable = _clip_equal(get_clipboard_text(), text)
+    tries = 0
+    while not stable and tries < CLIP_REWRITE_TRIES:
+        tries += 1
+        log("CLIP_CHANGED 粘贴前剪贴板被改写，第 %d 次重写" % tries)
+        if not set_clipboard_text(text):
+            break
+        time.sleep(0.05)
+        stable = _clip_equal(get_clipboard_text(), text)
+    if not stable:
+        log("CLIP_UNSTABLE 剪贴板内容反复变化，%s"
+            % ("远端触发，放弃本次投递" if remote else "放弃合成粘贴，退回逐字注入"))
+        return PASTE_NOT_SENT
+
+    # 前台窗口不等于输入焦点：焦点可能落在地址栏/工具栏/外壳上。
+    focus = focus_window()
+    fg = focus["fg"]
+    if not fg["hwnd"]:
+        log("PASTE_ABORT_FG 没有前台窗口，放弃合成粘贴，剪贴板保留识别文本")
+        return PASTE_BLOCKED
+    native = _is_text_class(focus["class"])
+    before = read_control_text(focus["hwnd"]) if native else None
+    log("PASTE_TARGET fg=%s|%s hwnd=%d focus=%d class=%s verify=%s"
+        % (fg["app"], fg["title"], fg["hwnd"], focus["hwnd"],
+           focus["class"] or "?", "on" if native else "off"))
+
+    # 读焦点/读文本可能花几百毫秒，期间用户可能切了窗口；发键前再确认一次。
+    now_fg = foreground_window()
+    if now_fg["hwnd"] != fg["hwnd"]:
+        log("PASTE_ABORT_FG_CHANGED 前台窗口已变化（%d -> %d|%s），放弃合成粘贴"
+            % (fg["hwnd"], now_fg["hwnd"], now_fg["app"]))
+        return PASTE_BLOCKED
+
+    changed = None
+    sent = False
+    if remote:
+        sent = _send_ctrl_v()
+        if not sent:
+            log("PASTE_SEND_FAIL Ctrl+V 没有完整送入，剪贴板保留识别文本")
+            return PASTE_NOT_SENT
+        changed = _verify_paste(focus["hwnd"], before)
+        if changed is True:
+            log("PASTE_OK 目标控件文本已变化")
+            return PASTE_OK
+        if changed is None:
+            log("PASTE_UNVERIFIED 已发 Ctrl+V，目标控件不支持读回，无法确认")
+            return PASTE_UNVERIFIED
+        log("PASTE_NO_CHANGE Ctrl+V 已发，但目标控件文本没变（远端触发，不回退）")
+        return PASTE_FAILED
+
+    if PASTE_METHOD in ("sendinput", "auto"):
+        sent = _send_ctrl_v()
+        if not sent:
+            log("PASTE_SEND_FAIL Ctrl+V 没有完整送入，剪贴板保留识别文本")
+        else:
+            changed = _verify_paste(focus["hwnd"], before)
+            if changed is True:
+                log("PASTE_OK 目标控件文本已变化")
+                return PASTE_OK
+            if changed is None:
+                log("PASTE_UNVERIFIED 已发 Ctrl+V，目标控件不支持读回，无法确认")
+                return PASTE_UNVERIFIED
+            log("PASTE_NO_CHANGE Ctrl+V 已发，但目标控件文本没变")
+
+    if PASTE_METHOD == "message" or (PASTE_METHOD == "auto" and changed is False):
+        if _paste_message(focus["hwnd"]):
+            changed = _verify_paste(focus["hwnd"], before)
+            if changed is True:
+                log("PASTE_OK WM_PASTE 后目标控件文本已变化")
+                return PASTE_OK
+            if changed is None:
+                log("PASTE_UNVERIFIED WM_PASTE 已发，目标控件不支持读回，无法确认")
+                return PASTE_UNVERIFIED
+            log("PASTE_NO_CHANGE WM_PASTE 后目标控件文本仍没变")
+        else:
+            log("PASTE_MSG_FAIL WM_PASTE 发送失败")
+
+    if changed is False:
+        return PASTE_FAILED
+    if sent:
+        return PASTE_UNVERIFIED
+    return PASTE_NOT_SENT
+
+
+def paste_text(text, remote=False):
     if not text:
         return
-    try:
-        type_text(text)
-    except Exception as e:
-        log("注入失败: %s" % str(e)[:100])
+    with _deliver_lock:
+        if remote:
+            try:
+                paste_clipboard(text, remote=True)
+            except Exception as e:
+                log("远端剪贴板投递异常: %s" % str(e)[:150])
+            return
+        if OUTPUT != "clipboard":
+            try:
+                type_text(text)
+            except Exception as e:
+                log("注入失败: %s" % str(e)[:100])
+            return
+        try:
+            result = paste_clipboard(text)
+            if result in (PASTE_OK, PASTE_UNVERIFIED):
+                return
+            if result == PASTE_BLOCKED:
+                log("剪贴板投递被前置检查拦下（%s），不退回逐字注入" % result)
+                return
+            log("剪贴板投递失败（%s），改用逐字注入" % result)
+        except Exception as e:
+            log("剪贴板投递异常: %s" % str(e)[:150])
+        try:
+            type_text(text)
+        except Exception as e:
+            log("逐字注入也失败: %s" % str(e)[:100])
 
 
 def main():
+    if not acquire_single_instance("Local\\VoiceLinkInput"):
+        return
     log("=" * 50)
     model = load_model()
     rec = Recorder()
     st = {"recording": False, "src": None, "last_evt": 0.0,
-          "kb_latched": False, "kb_press_at": 0.0}
-    lock = threading.Lock()
+          "kb_latched": False, "kb_press_at": 0.0, "remote": False,
+          "finishing": False, "remote_connected": False,
+          "remote_conns": 0, "rec_gen": 0}
+    lock = threading.RLock()
+    rec_lock = threading.Lock()
 
     def finish(tag):
-        audio = rec.stop()
-        unmute_background()
+        with lock:
+            if not st["recording"] or st["finishing"]:
+                return
+            st["finishing"] = True
+            remote_rec = st["remote"]
+        audio = None
+        try:
+            with rec_lock:
+                audio = rec.stop()
+        except Exception as e:
+            log("[%s] STOP_ERROR %s" % (tag, str(e)[:120]))
+        try:
+            unmute_background()
+        except Exception:
+            pass
         ui_state["status"] = "识别中…"
         with lock:
             st["recording"] = False
             st["src"] = None
+            st["remote"] = False
             st["kb_latched"] = False
             st["last_evt"] = time.time()
+            st["finishing"] = False
         try:
             app = foreground_app()
             if audio is None:
@@ -718,7 +1422,11 @@ def main():
             ui_state["status"] = "完成 %d 字" % len(text)
             log("[%s] OK %.1fs 音频 -> %.1fs，%d 字 | app=%s | %s"
                 % (tag, secs, cost, len(text), app, text[:60]))
-            paste_text(text)
+            # 远端触发时也走本地剪贴板 + 合成 Ctrl+V：MWB 会把剪贴板和按键
+            # 一起送到光标所在的机器，不需要再把文本经 TCP 发回去。
+            if remote_rec:
+                log("[%s] 远端触发，走剪贴板粘贴" % tag)
+            paste_text(text, remote=remote_rec)
             time.sleep(0.35)          # 让"完成"状态短暂可见
         finally:
             ui_state["active"] = False
@@ -726,44 +1434,88 @@ def main():
         while True:
             time.sleep(1)
             with lock:
-                if st["recording"] and time.time() - rec.start_at > MAX_SECONDS:
+                if (st["recording"] and not st["finishing"]
+                        and time.time() - rec.start_at > MAX_SECONDS):
                     threading.Thread(target=finish, args=("超时",), daemon=True).start()
 
     threading.Thread(target=watchdog, daemon=True).start()
 
     def start_rec(src):
+        with lock:
+            if st["finishing"]:
+                log("录音收尾中，忽略本次启动")
+                return False
         mute_background()
         try:
-            rec.start()
+            with rec_lock:
+                rec.start()
         except Exception as e:
+            unmute_background()
             log("录音失败: %s" % e)
             return False
-        st["recording"] = True
-        st["src"] = src
+        with lock:
+            st["rec_gen"] += 1
+            st["recording"] = True
+            st["src"] = src
         ui_state["status"] = "● 录音中"
         ui_state["active"] = True
         beep(880, 80)
         log("开始录音 (%s)" % src)
         return True
 
+    def discard_remote_after_grace(gen):
+        time.sleep(REMOTE_DISCONNECT_GRACE)
+        with lock:
+            if st["remote_connected"]:
+                return False
+            if (not st["recording"] or st["finishing"]
+                    or st["rec_gen"] != gen or st["src"] != "远端"
+                    or not st["remote"]):
+                return False
+            st["finishing"] = True
+        try:
+            with rec_lock:
+                rec.stop()
+        except Exception as e:
+            log("[远端断开] STOP_ERROR %s" % str(e)[:120])
+        try:
+            unmute_background()
+        except Exception:
+            pass
+        with lock:
+            st["recording"] = False
+            st["src"] = None
+            st["remote"] = False
+            st["kb_latched"] = False
+            st["last_evt"] = time.time()
+            st["finishing"] = False
+        ui_state["active"] = False
+        ui_state["status"] = "远端断开，已丢弃"
+        log("[远端断开] DISCARD_AUDIO 已丢弃本次远端录音")
+        beep(400, 120)
+        return True
+
     # 键盘：轻点=开关式，按住=对讲式
-    def kb_down(_e=None):
+    def kb_down(_e=None, remote=False):
         # 用事件自带时间戳，避免打开音频设备的耗时污染时长判断
         now = getattr(_e, "time", None) or time.time()
         with lock:
             if st["kb_latched"]:
                 st["kb_latched"] = False
-                threading.Thread(target=finish, args=("键盘-点按",), daemon=True).start()
+                tag = "远端-点按" if st["remote"] else "键盘-点按"
+                threading.Thread(target=finish, args=(tag,), daemon=True).start()
                 return
             if st["recording"]:
                 return
             st["kb_press_at"] = now
-            start_rec("键盘")
+            st["remote"] = remote
+            if not start_rec("远端" if remote else "键盘"):
+                st["remote"] = False
 
-    def kb_up(_e=None):
+    def kb_up(_e=None, remote=False):
         rel = getattr(_e, "time", None) or time.time()
         with lock:
-            if not st["recording"] or st["src"] != "键盘" or st["kb_latched"]:
+            if not st["recording"] or st["src"] not in ("键盘", "远端") or st["kb_latched"]:
                 return
             held = rel - st["kb_press_at"]
             if held < KB_TAP:
@@ -791,16 +1543,129 @@ def main():
         return
 
     try:
-        keyboard.on_press_key(HOTKEY, kb_down, suppress=False)
-        keyboard.on_release_key(HOTKEY, kb_up, suppress=False)
-        kb_ok = HOTKEY
+        codes = exact_scan_codes(HOTKEY)
+
+        def _kb_hook(e):
+            # 自己合成的事件不能当成热键，否则 clipboard 模式会自我触发录音
+            # keyboard 的钩子回调在独立线程里，可能晚于 SendInput 返回；留 200ms 窗口
+            if _injecting["n"] or (time.time() - _injecting["last"] < 0.20):
+                return
+            # 名字按虚拟键码解析（右 Ctrl=0xA3），扫描码只作补充；
+            # 只看扫描码会漏掉注入事件，只看名字会漏掉部分键盘的扩展扫描码。
+            if e.name != HOTKEY and e.scan_code not in codes:
+                return
+            if e.event_type == "down":
+                kb_down(e)
+            elif e.event_type == "up":
+                kb_up(e)
+
+        keyboard.hook(_kb_hook, suppress=False)
+        kb_ok = "%s [键码 %s]" % (HOTKEY, ",".join(str(c) for c in sorted(codes)))
+        log("键盘绑定只认 %s 的键码 %s" % (HOTKEY, sorted(codes)))
     except Exception as e:
         log("键盘注册失败: %s" % e)
         kb_ok = None
 
     install_mouse_hook(ms_down, ms_up, SUPPRESS_SIDE_BUTTONS)
+
+    # ---- 远端通道：戴尔键盘的右 Ctrl 经 TCP 过来，文本走本机剪贴板转发 ----
+    send_lock = threading.Lock()
+    remote_io_timeout = 6.0
+
+    def remote_session(conn):
+        peer = "%s:%d" % conn.getpeername()[:2]
+        log("远端已连接 %s" % peer)
+        authed = False
+        try:
+            conn.settimeout(5.0)
+            f = conn.makefile("rwb")
+            hello = f.readline()
+            if not hello:
+                return
+            msg = json.loads(hello.decode("utf-8"))
+            if msg.get("t") != "hello" or not REMOTE_TOKEN or msg.get("token") != REMOTE_TOKEN:
+                log("远端鉴权失败，已断开")
+                return
+
+            def send(obj):
+                try:
+                    with send_lock:
+                        f.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+                        f.flush()
+                    return True
+                except Exception as e:
+                    log("远端发送失败: %s" % str(e)[:80])
+                    return False
+
+            conn.settimeout(remote_io_timeout)
+            with lock:
+                authed = True
+                st["remote_conns"] += 1
+                st["remote_connected"] = True
+            if not send({"t": "ack"}):
+                return
+            log("远端鉴权通过 %s" % peer)
+
+            for line in f:
+                try:
+                    m = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                if m.get("t") == "hotkey":
+                    if m.get("action") == "down":
+                        kb_down(None, remote=True)
+                    else:
+                        kb_up(None, remote=True)
+                elif m.get("t") == "ping":
+                    if not send({"t": "pong"}):
+                        break
+        except socket.timeout:
+            log("远端心跳超时，判定离线 %s" % peer)
+        except Exception as e:
+            log("远端会话异常: %s" % str(e)[:100])
+        finally:
+            with lock:
+                if authed:
+                    st["remote_conns"] = max(0, st["remote_conns"] - 1)
+                st["remote_connected"] = st["remote_conns"] > 0
+                discard_gen = st["rec_gen"] if (
+                    st["recording"] and st["src"] == "远端" and st["remote"]
+                    and not st["remote_connected"]
+                ) else None
+            if discard_gen is not None:
+                log("远端断开，%.1fs 后丢弃本次远端录音" % REMOTE_DISCONNECT_GRACE)
+                threading.Thread(target=discard_remote_after_grace,
+                                 args=(discard_gen,), daemon=True).start()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            log("远端断开 %s" % peer)
+
+    def remote_server():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((REMOTE_BIND, REMOTE_PORT))
+            srv.listen(4)
+        except Exception as e:
+            log("远端通道监听失败（端口 %d）: %s" % (REMOTE_PORT, e))
+            return
+        log("远端通道监听 端口 %d" % REMOTE_PORT)
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except Exception as e:
+                log("远端 accept 失败: %s" % str(e)[:80])
+                time.sleep(1)
+                continue
+            threading.Thread(target=remote_session, args=(conn,), daemon=True).start()
+
+    if REMOTE_PORT:
+        threading.Thread(target=remote_server, daemon=True).start()
     threading.Thread(target=ui_thread, daemon=True).start()
 
+    log("投递方式: %s" % ("剪贴板 + 合成 Ctrl+V" if OUTPUT == "clipboard" else "逐字注入"))
     log("就绪。键盘 %s 按住说；鼠标侧键 按一下开、再按一下关。"
         % (kb_ok or "无"))
 
@@ -809,10 +1674,49 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         log("退出")
+    finally:
+        unmute_background()
+
+
+def paste_test(argv):
+    """不加载模型，直接验投递链路。先把光标点进目标输入框再运行：
+
+        python voice_input.py --paste-test "测试文字"
+        python voice_input.py --paste-test "测试文字" --clipboard
+        python voice_input.py --paste-test "测试文字" --inject
+
+    --clipboard / --inject 只是本次覆盖 config.json 的 output，不改文件。
+    """
+    i = argv.index("--paste-test")
+    text = argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith("--") \
+        else "剪贴板投递测试 ABC 123"
+    method = "clipboard" if (OUTPUT == "clipboard" or "--clipboard" in argv) else "inject"
+    if "--inject" in argv:
+        method = "inject"
+    probe = _INPUT(type=1, ki=_kb(VK_CONTROL, 0x1D, 0))
+    if probe.u.ki.wVk != VK_CONTROL or probe.u.ki.wScan != 0x1D:
+        print("!! INPUT 结构体填充失败：SendInput 只会发出全零事件")
+        return 1
+    print("投递方式: %s" % method)
+    print("3 秒后投递，请先把光标放到目标窗口...")
+    for n in (3, 2, 1):
+        print(n)
+        time.sleep(1)
+    if method == "clipboard":
+        result = paste_clipboard(text)
+        print("paste result: %s (method=%s)" % (result, PASTE_METHOD))
+    else:
+        type_text(text)
+        print("paste result: inject")
+    cur = get_clipboard_text()
+    print("done. clipboard: %s" % ((cur or "")[:40] or "(empty)"))
+    return 0
 
 
 if __name__ == "__main__":
     if "--devices" in sys.argv:
         list_devices()
+    elif "--paste-test" in sys.argv:
+        sys.exit(paste_test(sys.argv))
     else:
         main()
