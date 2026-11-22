@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/hero.png" alt="本地语音输入：Whisper 本机跑 · 无额度 · 不联网" width="800"></p>
+
 # 本地语音输入
 
 按一下键，说一句话，文字直接出现在光标处。全部在本机跑，不联网，不上传，没有额度限制。
@@ -236,3 +238,11 @@ issue 只回 bug，功能请求不保证回应。
 ## 许可
 
 MIT
+
+---
+
+<p align="center">
+  <img src="assets/avatar.png" width="64" alt="logo">
+  <br>
+  <sub><a href="https://github.com/ba4io/voice-input">github.com/ba4io/voice-input</a></sub>
+</p>
