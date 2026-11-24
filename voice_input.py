@@ -87,6 +87,7 @@ DEFAULTS = {
     "remote_bind": "0.0.0.0",       # 远端监听地址；填具体网卡 IP 可收窄暴露面
     "remote_disconnect_grace": 2.0, # 远端断开后等待多久丢弃本次录音
     "output": "inject",             # inject = 逐字注入（默认）；clipboard = 写剪贴板并合成粘贴
+    "beeps": True,                  # 是否播放开始/结束提示音
     "clipboard_paste_method": "auto",   # sendinput / message(WM_PASTE) / auto
     "clipboard_sync_delay": 0.30,   # 写剪贴板后等 MWB 同步/目标程序稳定的秒数
     "clipboard_verify_timeout": 0.80,   # 粘贴后等目标控件文本变化的秒数
@@ -273,20 +274,45 @@ def _make_tone(freq, ms, volume=0.5):
     return buf.getvalue()
 
 
-_TONE_HIGH = _make_tone(880, 90)
-_TONE_LOW = _make_tone(520, 130)
+_TONE_HIGH = _make_tone(880, 160, volume=0.65)
+_TONE_LOW = _make_tone(520, 200, volume=0.65)
+_BEEP_FILES = {}
+
+
+def _init_beep_files():
+    """内存播放不支持 SND_ASYNC，落成临时 wav 才能异步播、不阻塞主流程。"""
+    import tempfile
+    for name, data in (("hi", _TONE_HIGH), ("lo", _TONE_LOW)):
+        try:
+            p = os.path.join(tempfile.gettempdir(), "voice_input_%s.wav" % name)
+            with open(p, "wb") as f:
+                f.write(data)
+            _BEEP_FILES[name] = p
+        except Exception:
+            pass
 
 
 def beep(freq, ms=80):
-    """走普通音频通道播放提示音（主板蜂鸣器在很多机器上不响）。"""
+    """播放提示音：优先异步播临时 wav，失败退回同步内存播放/蜂鸣器。"""
+    if not CFG.get("beeps", True):
+        return
+    name = "hi" if freq >= 700 else "lo"
     try:
-        data = _TONE_HIGH if freq >= 700 else _TONE_LOW
-        winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+        p = _BEEP_FILES.get(name)
+        if p:
+            winsound.PlaySound(p, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        else:
+            winsound.PlaySound(_TONE_HIGH if name == "hi" else _TONE_LOW,
+                               winsound.SND_MEMORY)
+        log("提示音 %s" % ("高" if name == "hi" else "低"))
     except Exception:
         try:
             winsound.Beep(freq, ms)
         except Exception:
             pass
+
+
+_init_beep_files()
 
 
 def _model_candidates():
@@ -468,10 +494,16 @@ class Recorder:
         if not hint:
             return None, 1
         try:
-            cands = []
-            for i, d in enumerate(sd.query_devices()):
-                if d.get("max_input_channels", 0) > 0 and hint in d.get("name", "").lower():
-                    cands.append((i, d.get("max_input_channels", 0), d.get("name", "")))
+            # USB 设备被系统挂起后会在枚举里消失一小会儿，等一等再判定
+            deadline = time.time() + 0.8
+            while True:
+                cands = []
+                for i, d in enumerate(sd.query_devices()):
+                    if d.get("max_input_channels", 0) > 0 and hint in d.get("name", "").lower():
+                        cands.append((i, d.get("max_input_channels", 0), d.get("name", "")))
+                if cands or time.time() >= deadline:
+                    break
+                time.sleep(0.08)
             if not cands:
                 log("没有名字含「%s」的输入设备，改用系统默认" % DEVICE_HINT)
                 return None, 1
@@ -484,19 +516,42 @@ class Recorder:
             return None, 1
 
     def start(self):
+        last = None
+        for attempt in range(2):
+            try:
+                return self._start_once()
+            except Exception as e:
+                last = e
+                if attempt == 0:
+                    # USB 设备重新枚举后，进程里的设备列表会过期；刷新一次再试
+                    log("音频设备打开失败，重新枚举设备后重试: %s" % str(e)[:80])
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+        raise RuntimeError("打开输入失败: %s" % last)
+
+    def _start_once(self):
         self.frames = []
+        while not self.q.empty():      # 上一次失败尝试可能留下旧音频
+            try:
+                self.q.get_nowait()
+            except Exception:
+                break
         self.start_at = time.time()
         self.device, nch = self._pick()
         last = None
         chans = [nch, 2, 1] if nch >= 2 else [1]
-        rates = [SAMPLE_RATE, 44100, 48000]
         preferred = None
         try:
             preferred = int(sd.query_devices(self.device)["default_samplerate"])
         except Exception:
             pass
-        if preferred and preferred not in rates:
-            rates.append(preferred)
+        rates = []
+        for r in ([preferred] if preferred else []) + [SAMPLE_RATE, 44100, 48000]:
+            if r not in rates:
+                rates.append(r)
         for ch in chans:
             for sr in rates:
                 try:
@@ -574,6 +629,33 @@ def whisper_on():
         _whisper["mtime"] = m
         log("耳语模式: %s" % ("开" if _whisper["on"] else "关"))
     return _whisper["on"]
+
+
+LANGUAGE_FLAG = os.path.join(BASE_DIR, "language.txt")
+LANG_MODES = ("auto", "zh", "en", "tr")
+LANG_LABEL = {"auto": "自动", "zh": "中文", "en": "英文", "tr": "翻译(中→英)"}
+_lang = {"mtime": 0.0, "mode": None}
+
+
+def language_mode():
+    """language.txt 决定语言档位：auto / zh / en / tr。改文件即时生效。"""
+    try:
+        m = os.path.getmtime(LANGUAGE_FLAG)
+    except OSError:
+        default = "zh" if CFG.get("language") == "zh" else (
+            "en" if CFG.get("language") == "en" else "auto")
+        return default
+    if m != _lang["mtime"]:
+        try:
+            v = open(LANGUAGE_FLAG, encoding="utf-8").read().strip().lower()
+        except Exception:
+            v = ""
+        if v not in LANG_MODES:
+            v = "auto"
+        _lang["mode"] = v
+        _lang["mtime"] = m
+        log("语言档位: %s" % LANG_LABEL[v])
+    return _lang["mode"] or "auto"
 
 
 def foreground_app():
@@ -662,6 +744,8 @@ def fix_punct(t):
     """Whisper 中文输出习惯用半角逗号且句末无句号，这里补齐。"""
     if not t:
         return t
+    if not re.search(r"[一-鿿]", t):
+        return t.strip()          # 非中文输出不补中文标点
     for a, b in PUNCT_MAP.items():
         t = t.replace(a, b)
     t = t.strip()
@@ -1353,6 +1437,7 @@ def main():
             unmute_background()
         except Exception:
             pass
+        beep(660, 60)          # 说完停下的一声；必须在解除静音之后，否则又被静掉
         ui_state["status"] = "识别中…"
         with lock:
             st["recording"] = False
@@ -1399,16 +1484,27 @@ def main():
             if secs > MAX_SECONDS:
                 audio = audio[: SAMPLE_RATE * MAX_SECONDS]
                 secs = MAX_SECONDS
+            mode = language_mode()
+            lang = None if mode in ("auto", "tr") else mode
+            task = "translate" if mode == "tr" else "transcribe"
             t0 = time.time()
+            info = None
             try:
-                segments, _ = model.transcribe(
-                    audio, language=LANGUAGE, vad_filter=True,
+                segments, info = model.transcribe(
+                    audio, language=lang, task=task, vad_filter=True,
                     vad_parameters={"min_silence_duration_ms": 300},
                     beam_size=5, condition_on_previous_text=False)
                 text = join_segments(segments)
                 if not text and ratio > 0.30:
-                    segments, _ = model.transcribe(
-                        audio, language=LANGUAGE, vad_filter=False,
+                    segments, info = model.transcribe(
+                        audio, language=lang, task=task, vad_filter=False,
+                        beam_size=5, condition_on_previous_text=False)
+                    text = join_segments(segments)
+                if not text and mode == "tr":
+                    # 翻译档没有输出时退回原语言转写，至少让用户拿到内容
+                    log("[%s] 翻译无输出，退回原语言转写" % tag)
+                    segments, info = model.transcribe(
+                        audio, language=None, task="transcribe", vad_filter=False,
                         beam_size=5, condition_on_previous_text=False)
                     text = join_segments(segments)
             except Exception as e:
@@ -1419,6 +1515,9 @@ def main():
                 log("[%s] ASR_EMPTY_RESULT %.1fs 音频 %.1fs 处理 | app=%s" % (tag, secs, cost, app))
                 return
             text = fix_punct(clean_fillers(apply_hotwords(text)))
+            if mode in ("auto", "tr") and info is not None:
+                log("[%s] 语音判定: %s %.0f%% | 档位=%s"
+                    % (tag, info.language, info.language_probability * 100, LANG_LABEL[mode]))
             ui_state["status"] = "完成 %d 字" % len(text)
             log("[%s] OK %.1fs 音频 -> %.1fs，%d 字 | app=%s | %s"
                 % (tag, secs, cost, len(text), app, text[:60]))
@@ -1445,7 +1544,6 @@ def main():
             if st["finishing"]:
                 log("录音收尾中，忽略本次启动")
                 return False
-        mute_background()
         try:
             with rec_lock:
                 rec.start()
@@ -1458,8 +1556,10 @@ def main():
             st["recording"] = True
             st["src"] = src
         ui_state["status"] = "● 录音中"
+        beep(880, 80)          # 异步播放
+        time.sleep(0.20)       # 等音播完再静音，否则被自己掐断
+        mute_background()
         ui_state["active"] = True
-        beep(880, 80)
         log("开始录音 (%s)" % src)
         return True
 

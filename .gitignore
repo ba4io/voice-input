@@ -4,3 +4,4 @@ __pycache__/
 *.log
 config.json
 whisper.txt
+language.txt

@@ -130,6 +130,7 @@ set HF_ENDPOINT=https://huggingface.co
 | `mute_background` | 录音时是否静音其它声音 |
 | `clean_fillers` | 是否去掉"嗯、那个" |
 | `suppress_side_buttons` | 是否拦截鼠标侧键 |
+| `beeps` | 是否播放开始/结束提示音，默认 `true` |
 | `output` | 投递方式：`inject`（逐字注入，默认）/ `clipboard`（写剪贴板 + 合成粘贴） |
 | `clipboard_paste_method` | 剪贴板模式下怎么粘：`sendinput` / `message`（WM_PASTE）/ `auto` |
 | `clipboard_sync_delay` | 写剪贴板后等多久再发粘贴键（跨屏软件同步用），默认 0.30 秒 |
@@ -157,6 +158,23 @@ set HF_ENDPOINT=https://huggingface.co
 如果还想在**另一台机器的键盘**上按热键触发，把 `remote_agent.py` 拷到那台机器、配上
 `remote_host` / `remote_port` / `remote_token`，并在这台机器的 `config.json` 里打开
 `remote_port` 和同一个 `remote_token`。监听地址可用 `remote_bind` 收窄到具体网卡。
+
+### 语言切换
+
+双击 `语言.bat` 在四档之间循环，改的是同目录的 `language.txt`，程序热加载、不用重启：
+
+| 档位 | 说中文 | 说英文 |
+|---|---|---|
+| `zh` 中文（默认） | 中文 | 中文 |
+| `en` 英文 | 英文（会翻译） | 英文 |
+| `tr` 翻译 | **英文** | 英文 |
+| `auto` 自动 | 中文 | 英文 |
+
+`tr` 档调用 Whisper 内置的 translate 任务，只能翻成英文；翻译无输出时会自动退回原语言转写。
+
+### 提示音
+
+开始录音有一声高音、停下有一声低音。不需要的话在 `config.json` 里加 `"beeps": false`。
 
 ### 不知道麦克风叫什么
 
