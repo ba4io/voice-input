@@ -159,6 +159,9 @@ set HF_ENDPOINT=https://huggingface.co
 `remote_host` / `remote_port` / `remote_token`，并在这台机器的 `config.json` 里打开
 `remote_port` 和同一个 `remote_token`。监听地址可用 `remote_bind` 收窄到具体网卡。
 
+远端触发同样支持「轻点 = 开关式、按住 = 对讲式」。轻点判定会把「按下到设备真正开始录音」
+的固定开销（开流、提示音、等音播完、静音，通常 1 秒左右）自动扣掉，所以轻点不会被误判成按住。
+
 ### 语言切换
 
 双击 `语言.bat` 在四档之间循环，改的是同目录的 `language.txt`，程序热加载、不用重启：
@@ -233,6 +236,7 @@ set HF_ENDPOINT=https://huggingface.co
 | `DEVICE_SILENT` | 设备送的是数字静音（-90 dB 那种） |
 | `NO_SPEECH_DETECTED` | 有声帧比例太低，判定为没人说话 |
 | `ASR_EMPTY_RESULT` | 模型跑了但没出字 |
+| `ASR_HALLUCINATION` | 疑似静音编造，已丢弃（见下） |
 | `ASR_ERROR` | 模型报错 |
 
 常见原因：
@@ -240,6 +244,8 @@ set HF_ENDPOINT=https://huggingface.co
 - **按了没反应** → 先看进程在不在，再看日志最后一行
 - **对着某个程序说话没反应，别的程序正常** → 那个程序是以管理员身份运行的。Windows 不允许普通权限的钩子往高权限窗口输入，把语音输入也用管理员身份启动就行
 - **一直是 DEVICE_SILENT** → 换一个 USB 口。有些口供电不足，设备枚举正常但不送数据
+- **日志里是 `ASR_HALLUCINATION`** → 麦克风没收到人声，Whisper 在静音上编出了「Thank you.」「Thanks for watching!」这类句子，程序已经丢掉不投递。检查麦克风是否接好、系统默认输入设备是不是对的那个
+- **日志里「麦克风没就绪」** → 填了 `device_hint` 但那个设备当前不在设备列表里（比如 USB 刚插上还在枚举、或合盖唤醒后要过一会儿）。程序**不会**偷偷改用别的麦克风，等一两秒再按一次即可；不想这样就把 `device_hint` 清空
 - **系统采样率和设备对不上** → 程序会自己试 16k / 44.1k / 48k，日志里会写实际用的哪个
 - **识别很慢** → 多半是退回 CPU 了，看日志里"模型就绪"那行
 

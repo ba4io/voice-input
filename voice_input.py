@@ -432,8 +432,38 @@ def mute_background():
             if _mute_state.get("vol") is None and not vol.GetMute():
                 vol.SetMute(1, None)
                 _mute_state["vol"] = vol
+                try:
+                    open(_mute_flag_path(), "w").close()
+                except Exception:
+                    pass
     except Exception as e:
         log("静音背景音频失败: %s" % str(e)[:120])
+
+
+def _mute_flag_path():
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "voice_input_muted.flag")
+
+
+def recover_stale_mute():
+    """被强杀时 atexit 不执行，我们设的静音会留下来 —— 靠标记文件精确回收。"""
+    p = _mute_flag_path()
+    if not os.path.exists(p):
+        return
+    try:
+        import comtypes
+        comtypes.CoInitialize()
+        from pycaw.pycaw import AudioUtilities
+        v = AudioUtilities.GetSpeakers().EndpointVolume
+        if v.GetMute():
+            v.SetMute(0, None)
+            log("上次异常退出残留了静音，已恢复播放设备")
+    except Exception as e:
+        log("回收残留静音失败: %s" % str(e)[:120])
+    try:
+        os.remove(p)
+    except Exception:
+        pass
 
 
 def output_muted():
@@ -473,6 +503,10 @@ def unmute_background():
             if not v.GetMute():
                 with _mute_lock:
                     _mute_state["vol"] = None
+                try:
+                    os.remove(_mute_flag_path())
+                except Exception:
+                    pass
                 return
             log("恢复音量失败: 设备仍静音 (第 %d 次)" % attempt)
         except Exception as e:
@@ -515,33 +549,41 @@ class Recorder:
 
     def _pick(self):
         """按名字找设备；同名多个时优先选 2 声道的（多轨口容易取到空声道）。
-        device_hint 留空时返回 (None, 1)，也就是用系统默认输入设备。"""
+        device_hint 留空时返回 (None, 1)，也就是用系统默认输入设备。
+        hint 设了却找不到就抛异常，绝不静默改用默认麦——合盖唤醒后 X8 要过一会儿
+        才重新枚举，这段时间默认麦录到的是静音，Whisper 会把它编成英文句子。"""
         hint = (DEVICE_HINT or "").lower()
         if not hint:
             return None, 1
         try:
-            # USB 设备被系统挂起后会在枚举里消失一小会儿，等一等再判定
-            deadline = time.time() + 0.8
+            deadline = time.time() + 1.2
             while True:
                 cands = []
                 for i, d in enumerate(sd.query_devices()):
                     if d.get("max_input_channels", 0) > 0 and hint in d.get("name", "").lower():
                         cands.append((i, d.get("max_input_channels", 0), d.get("name", "")))
-                if cands or time.time() >= deadline:
+                if cands:
+                    cands.sort(key=lambda x: (0 if x[1] == 2 else 1, x[0]))
+                    idx, ch, name = cands[0]
+                    log("使用输入设备: [%d] %s (%d声道)" % (idx, name, ch))
+                    return idx, 2 if ch >= 2 else 1
+                if time.time() >= deadline:
                     break
                 time.sleep(0.08)
-            if not cands:
-                log("没有名字含「%s」的输入设备，改用系统默认" % DEVICE_HINT)
-                return None, 1
-            cands.sort(key=lambda x: (0 if x[1] == 2 else 1, x[0]))
-            idx, ch, name = cands[0]
-            log("使用输入设备: [%d] %s (%d声道)" % (idx, name, ch))
-            return idx, 2 if ch >= 2 else 1
         except Exception as e:
             log("设备解析失败: %s" % e)
             return None, 1
+        raise RuntimeError("名字含「%s」的输入设备没出现" % DEVICE_HINT)
 
     def start(self):
+        # 设备列表会随 USB 重新枚举而过期（合盖唤醒后尤其明显），过期时开流会报
+        # -9997。_terminate/_initialize 实测约 0ms，干脆每次开录前刷一遍，
+        # 省掉"先失败一次再重试"的那 0.7 秒
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
         last = None
         for attempt in range(2):
             try:
@@ -634,6 +676,36 @@ def join_segments(segments):
             out = out[:-1] + "。"
         out += t
     return out.strip()
+
+
+_HALLUCINATION_PATTERNS = (
+    "thank you", "thanks for watching", "thank you for watching",
+    "subtitles by", "subtitles", "amara.org", "transcribed by",
+    "dramatisk musikk", "teksting av", "undertekster", "takk for",
+    "sous-titres", "untertitel", "vielen dank",
+    "请不吝点赞", "明镜与点点", "字幕由", "字幕提供", "关注我的频道",
+    "ご視聴ありがとうございました", "チャンネル登録",
+)
+
+
+def looks_hallucinated(parts, info, secs):
+    """判断是不是 Whisper 在静音/底噪上编出来的句子：
+    没有语音概率高、语言置信度极低，或命中常见的字幕幻觉短语。"""
+    if not parts:
+        return False
+    avg_ns = sum(float(getattr(s, "no_speech_prob", 0.0) or 0.0)
+                 for s in parts) / len(parts)
+    prob = float(getattr(info, "language_probability", 1.0) or 1.0)
+    text = " ".join((s.text or "") for s in parts).strip().lower()
+    if avg_ns > 0.6:
+        return True
+    if prob < 0.35 and secs < 4.0:
+        return True
+    if prob < 0.6:
+        for p in _HALLUCINATION_PATTERNS:
+            if p in text and len(text) <= len(p) + 8:
+                return True
+    return False
 
 
 WHISPER_FLAG = os.path.join(BASE_DIR, "whisper.txt")
@@ -1438,6 +1510,7 @@ def main():
     if not acquire_single_instance("Local\\VoiceLinkInput"):
         return
     log("=" * 50)
+    recover_stale_mute()
     model = load_model()
     rec = Recorder()
     st = {"recording": False, "src": None, "last_evt": 0.0,
@@ -1515,30 +1588,41 @@ def main():
             task = "translate" if mode == "tr" else "transcribe"
             t0 = time.time()
             info = None
+            parts = []
+
+            def run(**kw):
+                gen, inf = model.transcribe(audio, **kw)
+                p = list(gen)
+                return join_segments(p), p, inf
+
             try:
-                segments, info = model.transcribe(
-                    audio, language=lang, task=task, vad_filter=True,
+                text, parts, info = run(
+                    language=lang, task=task, vad_filter=True,
                     vad_parameters={"min_silence_duration_ms": 300},
                     beam_size=5, condition_on_previous_text=False)
-                text = join_segments(segments)
                 if not text and ratio > 0.30:
-                    segments, info = model.transcribe(
-                        audio, language=lang, task=task, vad_filter=False,
+                    text, parts, info = run(
+                        language=lang, task=task, vad_filter=False,
                         beam_size=5, condition_on_previous_text=False)
-                    text = join_segments(segments)
                 if not text and mode == "tr":
                     # 翻译档没有输出时退回原语言转写，至少让用户拿到内容
                     log("[%s] 翻译无输出，退回原语言转写" % tag)
-                    segments, info = model.transcribe(
-                        audio, language=None, task="transcribe", vad_filter=False,
+                    text, parts, info = run(
+                        language=None, task="transcribe", vad_filter=False,
                         beam_size=5, condition_on_previous_text=False)
-                    text = join_segments(segments)
             except Exception as e:
                 log("[%s] ASR_ERROR %s | app=%s" % (tag, str(e)[:120], app))
                 return
             cost = time.time() - t0
             if not text:
                 log("[%s] ASR_EMPTY_RESULT %.1fs 音频 %.1fs 处理 | app=%s" % (tag, secs, cost, app))
+                return
+            if looks_hallucinated(parts, info, secs):
+                log("[%s] ASR_HALLUCINATION 疑似静音编造 %.1fs 置信 %.0f%% | app=%s | %s"
+                    % (tag, secs, float(getattr(info, "language_probability", 0) or 0) * 100,
+                       app, text[:60]))
+                ui_state["status"] = "没听清"
+                beep(400, 120)
                 return
             text = fix_punct(clean_fillers(apply_hotwords(text)))
             if mode in ("auto", "tr") and info is not None:
@@ -1574,12 +1658,15 @@ def main():
             if st["finishing"]:
                 log("录音收尾中，忽略本次启动")
                 return False
+        t_open = time.time()
         try:
             with rec_lock:
                 rec.start()
         except Exception as e:
             unmute_background()
+            ui_state["status"] = "麦克风没就绪"
             log("录音失败: %s" % e)
+            beep(400, 200)
             return False
         with lock:
             st["rec_gen"] += 1
@@ -1593,7 +1680,13 @@ def main():
         time.sleep(0.20)       # 等音播完再静音，否则被自己掐断
         mute_background()
         ui_state["active"] = True
-        log("开始录音 (%s)" % src)
+        # 远端按下到"真正能录"的全过程（开流 + 提示音 + 等音播完 + 静音）都要扣掉，
+        # 否则轻点会被这段固定开销顶成"按住"
+        cost = (time.time() - st["kb_press_at"]
+                if src == "远端" and st.get("kb_press_at") else time.time() - t_open)
+        with lock:
+            st["open_cost"] = cost
+        log("开始录音 (%s) 启动耗时 %.2fs" % (src, cost))
         return True
 
     def discard_remote_after_grace(gen):
@@ -1651,7 +1744,15 @@ def main():
             if not st["recording"] or st["src"] not in ("键盘", "远端") or st["kb_latched"]:
                 return
             held = rel - st["kb_press_at"]
-            if held < KB_TAP:
+            # 远端消息是同步处理的：按下那条要先跑完"打开设备"（实测约 1 秒），
+            # 松开那条才轮得到，于是轻点被量成 1 秒多。按本次实际打开耗时补偿，
+            # 各机型快慢不同也不会误判。
+            oc = st.get("open_cost") or 0.0
+            tap = KB_TAP + ((oc + 0.20) if remote else 0.0)
+            if remote:
+                log("远端松开: 量得 %.2fs，扣掉打开耗时 %.2fs 约 %.2fs（轻点门槛 %.2fs）"
+                    % (held, oc, held - oc, tap))
+            if held < tap:
                 st["kb_latched"] = True
                 ui_state["status"] = "● 录音中（再按结束）"
                 log("键盘连续录音中，再按一次结束")
