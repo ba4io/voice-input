@@ -436,21 +436,47 @@ def mute_background():
         log("静音背景音频失败: %s" % str(e)[:120])
 
 
+def output_muted():
+    """当前默认播放端点是否静音；读不到返回 None。"""
+    try:
+        import comtypes
+        comtypes.CoInitialize()
+        from pycaw.pycaw import AudioUtilities
+        return bool(AudioUtilities.GetSpeakers().EndpointVolume.GetMute())
+    except Exception:
+        return None
+
+
 def unmute_background():
+    # 状态只在真正取消静音成功后才清掉：曾因先清状态、再静默吞异常，
+    # 一次失败就把整个设备永久锁在静音上，提示音和系统所有声音一起哑。
     with _mute_lock:
         vol = _mute_state.get("vol")
-        if vol is None:
-            return
-        _mute_state["vol"] = None
+    if vol is None:
+        return
     try:
         import comtypes
         comtypes.CoInitialize()
     except Exception:
         pass
-    try:
-        vol.SetMute(0, None)
-    except Exception:
-        pass
+    for attempt in (1, 2):
+        v = vol
+        if attempt == 2:
+            try:
+                from pycaw.pycaw import AudioUtilities
+                v = AudioUtilities.GetSpeakers().EndpointVolume
+            except Exception as e:
+                log("恢复音量失败: 取不到播放设备 %s" % str(e)[:120])
+                return
+        try:
+            v.SetMute(0, None)
+            if not v.GetMute():
+                with _mute_lock:
+                    _mute_state["vol"] = None
+                return
+            log("恢复音量失败: 设备仍静音 (第 %d 次)" % attempt)
+        except Exception as e:
+            log("恢复音量失败 (第 %d 次): %s" % (attempt, str(e)[:120]))
 
 
 atexit.register(unmute_background)
@@ -1536,6 +1562,10 @@ def main():
                 if (st["recording"] and not st["finishing"]
                         and time.time() - rec.start_at > MAX_SECONDS):
                     threading.Thread(target=finish, args=("超时",), daemon=True).start()
+                    continue
+                idle = not st["recording"] and not st["finishing"]
+            if idle and _mute_state.get("vol") is not None:
+                unmute_background()
 
     threading.Thread(target=watchdog, daemon=True).start()
 
@@ -1556,6 +1586,9 @@ def main():
             st["recording"] = True
             st["src"] = src
         ui_state["status"] = "● 录音中"
+        unmute_background()    # 上一轮漏掉的静音先还回去，否则这次的起音听不到
+        if output_muted():
+            log("警告: 系统播放设备处于静音，提示音听不到")
         beep(880, 80)          # 异步播放
         time.sleep(0.20)       # 等音播完再静音，否则被自己掐断
         mute_background()
