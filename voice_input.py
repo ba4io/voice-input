@@ -279,17 +279,22 @@ _TONE_LOW = _make_tone(520, 200, volume=0.65)
 _BEEP_FILES = {}
 
 
-def _init_beep_files():
-    """内存播放不支持 SND_ASYNC，落成临时 wav 才能异步播、不阻塞主流程。"""
+def _init_beep_files(force=False):
+    """内存播放不支持 SND_ASYNC，落成 wav 才能异步播、不阻塞主流程。
+    优先写程序目录：临时目录会被系统当垃圾清掉，清掉后就退回 winsound.Beep
+    的蜂鸣器方波，又刺耳又难听。"""
     import tempfile
     for name, data in (("hi", _TONE_HIGH), ("lo", _TONE_LOW)):
-        try:
-            p = os.path.join(tempfile.gettempdir(), "voice_input_%s.wav" % name)
-            with open(p, "wb") as f:
-                f.write(data)
-            _BEEP_FILES[name] = p
-        except Exception:
-            pass
+        for base in (BASE_DIR, tempfile.gettempdir()):
+            try:
+                p = os.path.join(base, "voice_input_%s.wav" % name)
+                if force or not os.path.exists(p) or os.path.getsize(p) != len(data):
+                    with open(p, "wb") as f:
+                        f.write(data)
+                _BEEP_FILES[name] = p
+                break
+            except Exception:
+                continue
 
 
 def beep(freq, ms=80):
@@ -299,17 +304,25 @@ def beep(freq, ms=80):
     name = "hi" if freq >= 700 else "lo"
     try:
         p = _BEEP_FILES.get(name)
+        if p and not os.path.exists(p):
+            _init_beep_files(force=True)      # 文件被系统清理过，就地重写
+            p = _BEEP_FILES.get(name)
         if p:
             winsound.PlaySound(p, winsound.SND_FILENAME | winsound.SND_ASYNC)
         else:
             winsound.PlaySound(_TONE_HIGH if name == "hi" else _TONE_LOW,
                                winsound.SND_MEMORY)
         log("提示音 %s" % ("高" if name == "hi" else "低"))
-    except Exception:
-        try:
-            winsound.Beep(freq, ms)
+    except Exception as e:
+        log("提示音播放失败: %s" % str(e)[:80])
+        try:                                   # 最后退路才用蜂鸣器方波
+            winsound.PlaySound(_TONE_HIGH if name == "hi" else _TONE_LOW,
+                               winsound.SND_MEMORY)
         except Exception:
-            pass
+            try:
+                winsound.Beep(freq, ms)
+            except Exception:
+                pass
 
 
 _init_beep_files()
