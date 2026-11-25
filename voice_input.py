@@ -230,10 +230,25 @@ def ui_thread():
         txt = cv.create_text(12, 10, anchor="w", fill="#cccccc",
                              text="", font=("Microsoft YaHei UI", 9))
 
+        def place_on_screen():
+            """合盖换屏后分辨率变了，浮窗会停在屏幕外；出界就重新摆到当前屏底部居中。"""
+            try:
+                vx, vy = root.winfo_vrootx(), root.winfo_vrooty()
+                vw, vh = root.winfo_vrootwidth(), root.winfo_vrootheight()
+                x, y = root.winfo_x(), root.winfo_y()
+                if (x + W >= vx and y + H >= vy
+                        and x <= vx + vw and y <= vy + vh):
+                    return
+                sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+                root.geometry("%dx%d+%d+%d" % (W, H, (sw - W) // 2, sh - H - 140))
+            except Exception:
+                pass
+
         def tick():
             try:
                 if ui_state["active"]:
                     if not root.winfo_ismapped():
+                        place_on_screen()
                         root.deiconify()
                     lvl = ui_state["level"]
                     _ui_hist.append(lvl)
