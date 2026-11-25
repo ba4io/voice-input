@@ -567,6 +567,7 @@ class Recorder:
         self.start_at = 0
         self.device = None   # 每次录音前重新解析
         self.samplerate = SAMPLE_RATE
+        self._hint_missing = False
 
     def _cb(self, indata, frames, time_info, status):
         self.q.put(indata.copy())
@@ -577,14 +578,14 @@ class Recorder:
 
     def _pick(self):
         """按名字找设备；同名多个时优先选 2 声道的（多轨口容易取到空声道）。
-        device_hint 留空时返回 (None, 1)，也就是用系统默认输入设备。
-        hint 设了却找不到就抛异常，绝不静默改用默认麦——合盖唤醒后 X8 要过一会儿
-        才重新枚举，这段时间默认麦录到的是静音，Whisper 会把它编成英文句子。"""
+        device_hint 留空、或那个设备不在（比如 X8 关了）时，退回系统默认输入设备。
+        合盖唤醒后 X8 要过一会儿才重新枚举，所以第一次找不到会等 1.2 秒；
+        上一轮就没找到的话不再干等，直接用默认麦。"""
         hint = (DEVICE_HINT or "").lower()
         if not hint:
             return None, 1
         try:
-            deadline = time.time() + 1.2
+            deadline = time.time() + (0.0 if self._hint_missing else 1.2)
             while True:
                 cands = []
                 for i, d in enumerate(sd.query_devices()):
@@ -593,6 +594,9 @@ class Recorder:
                 if cands:
                     cands.sort(key=lambda x: (0 if x[1] == 2 else 1, x[0]))
                     idx, ch, name = cands[0]
+                    if self._hint_missing:
+                        log("「%s」回来了" % DEVICE_HINT)
+                        self._hint_missing = False
                     log("使用输入设备: [%d] %s (%d声道)" % (idx, name, ch))
                     return idx, 2 if ch >= 2 else 1
                 if time.time() >= deadline:
@@ -601,7 +605,10 @@ class Recorder:
         except Exception as e:
             log("设备解析失败: %s" % e)
             return None, 1
-        raise RuntimeError("名字含「%s」的输入设备没出现" % DEVICE_HINT)
+        if not self._hint_missing:
+            log("没找到「%s」，改用系统默认麦克风" % DEVICE_HINT)
+            self._hint_missing = True
+        return None, 1
 
     def start(self):
         # 设备列表会随 USB 重新枚举而过期（合盖唤醒后尤其明显），过期时开流会报
